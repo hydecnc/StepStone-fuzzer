@@ -1,4 +1,13 @@
 #
+# NOTE: a call declared here is NOT reachable until its name is also added to
+# "enable_syscalls" in tutorial/default.cfg.  syz-manager builds its enabled set
+# from that list (pkg/mgrconfig/load.go:301), and loadProg
+# (syz-manager/manager.go:690) drops or truncates any corpus/seed program that
+# uses a call outside it.  syz_mixed_gsp_status_msg was declared in round 1 but
+# left out of the list and executed 0 times in round 2 as a result.
+#
+
+#
 # Raw write into the GSP message queue shared buffer.
 #
 # The buffer is the whole mapping: page table, command queue, status queue.
