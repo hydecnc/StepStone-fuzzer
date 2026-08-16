@@ -2466,6 +2466,38 @@ var linuxOopses = append([]*oops{
 	// 	crash.UnknownType,
 	// },
 	{
+		// One format per code, not a %[1]v capture: dynamicTitleReplacement
+		// rewrites a space-delimited decimal to "NUM" and would merge them.
+		[]byte("NVRM: Xid"),
+		[]oopsFormat{
+			{
+				title:        compile(`NVRM: Xid \(PCI:[^)]*\): 119`),
+				fmt:          "NVRM: GSP RPC timeout (GPU wedged, VM spent)",
+				noStackTrace: true,
+			},
+			{
+				title:        compile(`NVRM: Xid \(PCI:[^)]*\): 120`),
+				fmt:          "NVRM: GSP task exception (GPU wedged, VM spent)",
+				noStackTrace: true,
+			},
+			{
+				title:        compile(`NVRM: Xid \(PCI:[^)]*\): 79`),
+				fmt:          "NVRM: GPU has fallen off the bus",
+				noStackTrace: true,
+			},
+			{
+				title:        compile(`NVRM: Xid \(PCI:[^)]*\): 62`),
+				fmt:          "NVRM: PMU halt (GPU wedged, VM spent)",
+				noStackTrace: true,
+			},
+		},
+		[]*regexp.Regexp{
+			// CUDA-triggered, device survives.
+			compile(`NVRM: Xid \(PCI:[^)]*\): (13|31|43|69),`),
+		},
+		crash.UnknownType,
+	},
+	{
 		[]byte("trusty: panic"),
 		[]oopsFormat{
 			{

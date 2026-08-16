@@ -74,6 +74,16 @@ Two kinds of crash come out of this fuzzer and they are treated in opposite ways
 
 If you cannot decide which one you are holding, treat it as a memory-safety report and change nothing. A missed round costs an hour; a constraint that quietly suppresses the finding costs the whole experiment.
 
+### Xid lines end the run
+
+A wedged GPU leaves the kernel healthy, so it used to go undetected and the fuzzer spent the rest of the round executing programs against a dead device. `syz-manager` now treats `NVRM: Xid (PCI:...): 119 | 120 | 79 | 62` as a crash: the round stops at that line and the VM is replaced. A `report` file will exist, titled `NVRM: GSP RPC timeout`, `NVRM: GSP task exception`, `NVRM: GPU has fallen off the bus`, or `NVRM: PMU halt`. Xid 13, 31, 43 and 69 are ignored; the device survives those.
+
+Three consequences for your analysis:
+
+- A log ending shortly after an Xid is not a plateau. The round ended because the GPU stopped answering, not because the fuzzer ran out of new coverage. Do not analyse it as a quiet run.
+- **These are liveness failures, including Xid 120.** An Xid is the driver reporting a GPU-side failure, not a defect in the driver; 120 in particular carries a register dump from the GSP's own RISC-V core. The threat model already grants the attacker full control of the GPU, so faulting its firmware wins nothing. Constrain it away like any other liveness failure.
+- The Xid is printed once per run. The driver suppresses further RPC error output after the first fatal error, so the absence of later Xid lines means nothing and counting occurrences tells you nothing.
+
 ## Constraint discipline
 
 The value of this method comes from adding as little as possible, as late as possible. So:
