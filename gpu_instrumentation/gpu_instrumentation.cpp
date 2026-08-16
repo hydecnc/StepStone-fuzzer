@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <vector>
 
 // Helper to insert U32 to a buffer
@@ -45,8 +46,31 @@ constexpr std::uint64_t ELEM_SEQNUM{36};
 constexpr std::uint64_t ELEM_HDR_SIZE{48};
 // rpc_message_header_v03_00.length is the third NvU32 of the rpc header.
 constexpr std::uint64_t ELEM_RPC_LENGTH{ELEM_HDR_SIZE + 8};
+// rpc_message_header_v03_00.function is the fourth NvU32 of the rpc header.
+constexpr std::uint64_t ELEM_RPC_FUNCTION{ELEM_HDR_SIZE + 12};
 // sizeof(GSP_MSG_QUEUE_ELEMENT): header plus the 32 byte rpc header.
 constexpr std::uint64_t ELEM_MIN_SIZE{ELEM_HDR_SIZE + 32};
+
+//
+// NV_VGPU_MSG_EVENT_FIRST_EVENT, ogkm/src/nvidia/inc/kernel/vgpu/rpc_global_enums.h:238.
+// GSP -> CPU messages below this are returns for a CPU -> GSP RPC, which
+// _kgspRpcRecvPoll (kernel_gsp.c:2063) may be blocked on; at or above it they
+// are asynchronous events that nothing waits for.
+//
+constexpr std::uint32_t RPC_FIRST_EVENT{0x1000};
+
+// How long gspStatusMsg waits for the GSP to leave a message in the queue.
+constexpr std::uint64_t SUBSTITUTE_WAIT_NS{50ull * 1000 * 1000};
+
+std::uint64_t monotonicNs()
+{
+	struct timespec ts;
+	ts.tv_sec = 0;
+	ts.tv_nsec = 0;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull +
+	       static_cast<std::uint64_t>(ts.tv_nsec);
+}
 
 // GSP_MSG_QUEUE_ELEMENT_SIZE_MIN, message_queue_priv.h:91
 constexpr std::uint32_t DEFAULT_MSG_SIZE{4096};
@@ -168,6 +192,24 @@ std::uint32_t readReadPtr(const GspMsgQueue::Info& info, const Geometry& geo)
 	// Mirror unreadable or out of range: the queue is idle iff writePtr == readPtr.
 	return geo.writePtr < geo.msgCount ? geo.writePtr : 0;
 }
+
+//
+// The GSP's own write pointer, re-read live.  msgqTxSubmitBuffers (msgq.c:526)
+// stores the GSP's private tx.writePtr here on every submit, so this is the
+// only honest statement of how many status queue slots actually hold a message.
+//
+std::uint32_t readWritePtr(const GspMsgQueue::Info& info)
+{
+	const auto wp{injectorReadMemoryU32(info.status_queue_offset + TX_WRITE_PTR)};
+	return wp ? *wp : ~0u;
+}
+
+std::uint64_t slotOffset(const GspMsgQueue::Info& info, const Geometry& geo,
+			 const std::uint32_t slot)
+{
+	return info.status_queue_offset + geo.entryOff +
+	       static_cast<std::uint64_t>(slot) * geo.msgSize;
+}
 } // namespace
 
 /**
@@ -209,21 +251,36 @@ int insertBuffer(std::uint8_t* buffer, const std::uint32_t size, const std::uint
 }
 
 /**
- * gspStatusMsg: place one GSP -> driver status queue message where the driver
- * will read it next, and advertise it.
+ * gspStatusMsg: overwrite a GSP -> driver status queue message that the GSP has
+ * already produced and the driver has not yet consumed.
  *
  * @elem:     the element bytes, laid out as GSP_MSG_QUEUE_ELEMENT
  * @size:     length of @elem, in bytes
- * @avail:    how many elements the queue should advertise as readable
- * @seqDelta: 0..32, applied as (derived sequence number + seqDelta - 16)
+ * @seqDelta: 0..32, applied as (victim sequence number + seqDelta - 16)
  *
- * static:  every byte of @elem apart from checkSum and seqNum, plus @avail and
- *          @seqDelta.
- * dynamic: the target slot, seqNum, checkSum and the status queue writePtr,
- *          all read from or written to live shared memory.
+ * static:  every byte of @elem apart from checkSum and seqNum - authTag, aad,
+ *          elemCount, the whole rpc header and the payload - plus @seqDelta.
+ * dynamic: the target slot and the victim's seqNum, both read live, and
+ *          checkSum, solved from the resulting bytes.
+ *
+ * This call substitutes; it never appends.  Round 3's crash
+ * f5b7286d "NVRM: GSP RPC timeout" came from appending: the old code raised the
+ * status queue writePtr (msgq.c:526 is the GSP's only writer of that field) so
+ * the driver consumed a slot the GSP had not filled yet.  msgqRxMarkConsumed
+ * (msgq.c:675) then left the driver's private rxReadPtr one slot ahead of the
+ * GSP's private tx.writePtr, the GSP's next message landed in a slot the driver
+ * had already passed, msgqRxGetReadAvailable (msgq.c:615) reported 0 for it and
+ * _kgspRpcRecvPoll (kernel_gsp.c:2097) spun out its 45s timeout on the reply
+ * that message was.  Overwriting an already-produced element advances neither
+ * pointer, so the two sides stay in step.
+ *
+ * The victim must also be an asynchronous event (rpc.function >=
+ * NV_VGPU_MSG_EVENT_FIRST_EVENT).  Destroying an RPC return would strand
+ * whatever _kgspRpcRecvPoll is polling for and produce the same timeout without
+ * any pointer skew.
  */
 int gspStatusMsg(const std::uint8_t* elem, const std::uint32_t size,
-		 const std::uint32_t avail, const std::uint32_t seqDelta)
+		 const std::uint32_t seqDelta)
 {
 	if (elem == nullptr || size < ELEM_MIN_SIZE) {
 		errno = EINVAL;
@@ -246,8 +303,6 @@ int gspStatusMsg(const std::uint8_t* elem, const std::uint32_t size,
 		return -1;
 	}
 
-	const std::uint32_t slot{readReadPtr(*info, geo)};
-
 	// One message may not wrap onto itself.
 	const std::uint32_t nSlots{(size + geo.msgSize - 1) / geo.msgSize};
 	if (nSlots > geo.msgCount - 1) {
@@ -255,27 +310,88 @@ int gspStatusMsg(const std::uint8_t* elem, const std::uint32_t size,
 		return -1;
 	}
 
-	std::uint32_t nAvail{avail};
-	if (nAvail == 0) {
-		nAvail = 1;
-	}
-	if (nAvail > geo.msgCount - 1) {
-		nAvail = geo.msgCount - 1;
+	//
+	// Wait for the GSP to leave an event in the queue.  Both pointers are
+	// re-read every pass: the driver drains from its own poll loop and from
+	// the interrupt bottom half, so an availability read goes stale fast.
+	//
+	std::uint32_t slot{0};
+	std::uint32_t victimSeq{0};
+	std::uint32_t victimFn{0};
+	std::uint32_t nWrite{0};
+	std::uint32_t lastAvail{0};
+	const std::uint64_t deadline{monotonicNs() + SUBSTITUTE_WAIT_NS};
+
+	while (monotonicNs() < deadline) {
+		const std::uint32_t wp{readWritePtr(*info)};
+		if (wp >= geo.msgCount) {
+			continue;
+		}
+		const std::uint32_t rp{readReadPtr(*info, geo)};
+		if (rp >= geo.msgCount) {
+			continue;
+		}
+		const std::uint32_t nAvail{(wp + geo.msgCount - rp) % geo.msgCount};
+		lastAvail = nAvail;
+		if (nAvail == 0) {
+			continue;
+		}
+
+		//
+		// Take the longest run of event slots starting at the read
+		// pointer, capped by what the GSP produced and by what @elem
+		// actually fills.
+		//
+		std::uint32_t n{0};
+		const std::uint32_t want{std::min(nSlots, nAvail)};
+		for (; n < want; ++n) {
+			const std::uint64_t off{
+			    slotOffset(*info, geo, (rp + n) % geo.msgCount)};
+			const auto fn{injectorReadMemoryU32(off + ELEM_RPC_FUNCTION)};
+			if (!fn || *fn < RPC_FIRST_EVENT) {
+				break;
+			}
+			if (n == 0) {
+				victimFn = *fn;
+			}
+		}
+		if (n == 0) {
+			continue;
+		}
+
+		const auto seq{
+		    injectorReadMemoryU32(slotOffset(*info, geo, rp) + ELEM_SEQNUM)};
+		if (!seq) {
+			continue;
+		}
+
+		slot = rp;
+		victimSeq = *seq;
+		nWrite = n;
+		break;
 	}
 
-	std::vector<std::uint8_t> buf(elem, elem + size);
+	if (nWrite == 0) {
+		fprintf(stderr,
+			"[GPU INSTRUMENTATION] status msg: no event pending, avail=%u "
+			"msgCount=%u size=%u\n",
+			lastAvail, geo.msgCount, size);
+		errno = EAGAIN;
+		return -1;
+	}
+
+	// Only the slots we are allowed to overwrite get written.
+	std::vector<std::uint8_t> buf(
+	    elem, elem + std::min<std::uint64_t>(
+			     size, static_cast<std::uint64_t>(nWrite) * geo.msgSize));
 
 	//
 	// GspMsgQueueReceiveStatus accepts an element only when its seqNum equals
 	// pMQI->rxSeqNum (message_queue_cpu.c:697), a driver-private counter.  The
-	// element the driver consumed last is still sitting in the slot before the
-	// read pointer and carries rxSeqNum - 1.
+	// element we are overwriting has not been consumed yet, so its own seqNum
+	// is exactly the value the driver is about to demand.
 	//
-	const std::uint32_t prevSlot{(slot + geo.msgCount - 1) % geo.msgCount};
-	const std::uint64_t prevOff{info->status_queue_offset + geo.entryOff +
-				    static_cast<std::uint64_t>(prevSlot) * geo.msgSize};
-	const auto prevSeq{injectorReadMemoryU32(prevOff + ELEM_SEQNUM)};
-	const std::uint32_t seqNum{(prevSeq ? *prevSeq : 0u) + 1u + seqDelta - 16u};
+	const std::uint32_t seqNum{victimSeq + seqDelta - 16u};
 	putU32(buf, ELEM_SEQNUM, seqNum);
 
 	//
@@ -296,13 +412,13 @@ int gspStatusMsg(const std::uint8_t* elem, const std::uint32_t size,
 	//
 	// Write the element across consecutive slots, wrapping.  The driver's
 	// staging copy (message_queue_cpu.c:652) concatenates slots in read order,
-	// so a wrap in the queue is still contiguous once staged.
+	// so a wrap in the queue is still contiguous once staged.  writePtr is
+	// deliberately left alone; see the note above.
 	//
 	std::uint64_t done{0};
-	for (std::uint32_t i{0}; i < nSlots; ++i) {
-		const std::uint32_t s{(slot + i) % geo.msgCount};
-		const std::uint64_t off{info->status_queue_offset + geo.entryOff +
-					static_cast<std::uint64_t>(s) * geo.msgSize};
+	for (std::uint32_t i{0}; i < nWrite && done < buf.size(); ++i) {
+		const std::uint64_t off{
+		    slotOffset(*info, geo, (slot + i) % geo.msgCount)};
 		const std::uint64_t chunk{
 		    std::min<std::uint64_t>(geo.msgSize, buf.size() - done)};
 		std::vector<std::uint8_t> part(buf.begin() + done,
@@ -314,25 +430,15 @@ int gspStatusMsg(const std::uint8_t* elem, const std::uint32_t size,
 		done += chunk;
 	}
 
-	//
-	// Advertise it.  msgqRxGetReadAvailable (msgq.c:610) ignores the queue
-	// entirely when writePtr >= msgCount, and reports
-	// (writePtr + msgCount - rxReadPtr) % msgCount otherwise.
-	//
-	const std::uint32_t writePtr{(slot + nAvail) % geo.msgCount};
-	if (!injectorWriteMemoryU32(info->status_queue_offset + TX_WRITE_PTR, writePtr)) {
-		errno = EIO;
-		return -1;
-	}
-
 	fprintf(stderr,
-		"[GPU INSTRUMENTATION] status msg: hdr=%s slot=%u nslots=%u writePtr=%u "
-		"msgCount=%u prevSeq=%u seqNum=%u elemCount=%u fn=0x%x rpcLen=0x%x size=%u\n",
-		geo.live ? "live" : "fallback", slot, nSlots, writePtr, geo.msgCount,
-		prevSeq ? *prevSeq : 0u, seqNum,
+		"[GPU INSTRUMENTATION] status msg: hdr=%s slot=%u nwrite=%u nslots=%u "
+		"avail=%u msgCount=%u victimFn=0x%x victimSeq=%u seqNum=%u elemCount=%u "
+		"fn=0x%x rpcLen=0x%x size=%u\n",
+		geo.live ? "live" : "fallback", slot, nWrite, nSlots, lastAvail,
+		geo.msgCount, victimFn, victimSeq, seqNum,
 		bufToU32(std::vector<std::uint8_t>(buf.begin() + 40, buf.begin() + 44)),
-		bufToU32(std::vector<std::uint8_t>(buf.begin() + ELEM_HDR_SIZE + 12,
-						   buf.begin() + ELEM_HDR_SIZE + 16)),
+		bufToU32(std::vector<std::uint8_t>(buf.begin() + ELEM_RPC_FUNCTION,
+						   buf.begin() + ELEM_RPC_FUNCTION + 4)),
 		rpcLength, size);
 
 	return 0;

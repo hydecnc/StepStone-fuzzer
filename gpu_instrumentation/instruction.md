@@ -74,6 +74,8 @@ Two kinds of crash come out of this fuzzer and they are treated in opposite ways
 
 If you cannot decide which one you are holding, treat it as a memory-safety report and change nothing. A missed round costs an hour; a constraint that quietly suppresses the finding costs the whole experiment.
 
+The run may have produced several distinct crashes. The one you are given is the round's target and I selected it. Work on that one. Do not go looking for the others — not in a syzkaller workdir, not anywhere else — and do not widen the round to cover more than the crash in front of you.
+
 ### Xid lines end the run
 
 A wedged GPU leaves the kernel healthy, so it used to go undetected and the fuzzer spent the rest of the round executing programs against a dead device. `syz-manager` now treats `NVRM: Xid (PCI:...): 119 | 120 | 79 | 62` as a crash: the round stops at that line and the VM is replaced. A `report` file will exist, titled `NVRM: GSP RPC timeout`, `NVRM: GSP task exception`, `NVRM: GPU has fallen off the bus`, or `NVRM: PMU halt`. Xid 13, 31, 43 and 69 are ignored; the device survives those.
@@ -151,13 +153,25 @@ round | blocker (file:line) | constraint added | static/dynamic/mixed | outcome
 
 No prose in the ledger. Prose is how a record turns back into a hypothesis that the next round then spends itself confirming. If the file does not exist yet, create it with that header line.
 
+## Preserved findings
+
+`StepStone-fuzzer/gpu_instrumentation/FINDINGS.md` lists the memory-safety reports found so far, one line each:
+
+```
+crash signature | file:line | do not constrain
+```
+
+They are the product and they must survive your change. A constraint that removes one is the worst outcome available to you and it is silent — the crash simply stops appearing, and the next round reads that as progress. So before you finish, check your constraint against every line and say in one sentence why it removes none of them.
+
+Do not analyse these, do not try to reproduce them, and do not treat them as this round's target. The line exists so you can perform that check, nothing more. If you find a new memory-safety report this round, append a line for it.
+
 ## What to hand back each round
 
 1. What the round was: a crash, or a quiet run.
    - **Crash** — the root cause, with `file:line` into the driver or kernel source, and which of the two crash kinds it is.
    - **Quiet run** — the earliest point at which the injection stops making progress: which arguments actually varied, which values survived into the corpus, and the first check on the path from the injection site to the target code that turns the input away. Estimate the probability that random bytes pass that check. The estimate is what separates a real bottleneck from an assumed one, so give it even when it is rough.
 2. The constraint you are adding, in what form, and whether it is static, dynamic, or mixed.
-3. Which blocker or crash it removes, and your reasoning for why it does not also remove anything else.
+3. Which blocker or crash it removes, and your reasoning for why it does not also remove anything else — including each line of `FINDINGS.md`.
 4. The seed program, if one is needed, and what state you expect it to reach.
 5. Anything you inferred rather than confirmed from source, marked as such — including any assumption you had to make because you could not ask.
 6. The ledger lines you wrote.

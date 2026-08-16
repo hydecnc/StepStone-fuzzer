@@ -56,22 +56,34 @@ gsp_status_element {
 } [packed]
 
 #
-# Place one GSP -> driver status queue message where the driver will read it next.
+# Overwrite a status queue message the GSP has already produced and the driver
+# has not yet consumed.
 #
 # mixed:
 #   static  - every byte of @elem except check_sum and seq_num: auth_tag, aad,
 #             elem_count, the whole rpc header (length, function, ...) and the
-#             payload.  @avail, @seq_delta.
+#             payload.  @seq_delta.
 #   dynamic - the target slot, taken from the driver's own mirrored read pointer
-#             (msgq.c:682 writes it there); seq_num, derived from the sequence
-#             number left in the previously consumed slot; check_sum, solved so
-#             _checkSum32 over GSP_MSG_QUEUE_ELEMENT_HDR_SIZE + rpc.length comes
-#             out zero (message_queue_priv.h:112); and the status queue writePtr,
-#             set to slot + @avail so msgqRxGetReadAvailable (msgq.c:615) reports
-#             @avail elements.
+#             (msgq.c:682 writes it there); seq_num, taken from the unconsumed
+#             element being overwritten, which by definition carries the driver's
+#             current rxSeqNum; and check_sum, solved so _checkSum32 over
+#             GSP_MSG_QUEUE_ELEMENT_HDR_SIZE + rpc.length comes out zero
+#             (message_queue_priv.h:112).
 #
-# @avail is how many elements the queue is made to advertise, independent of
-# elem_count, so the copy loop at message_queue_cpu.c:632 can be driven past the
-# 16-element staging area.
+# The @avail argument is gone and the harness no longer writes the status queue
+# writePtr at all.  Round 3, crash f5b7286d "NVRM: GSP RPC timeout": raising
+# writePtr made the driver consume a slot the GSP had not filled, so
+# msgqRxMarkConsumed (msgq.c:675) left rxReadPtr one ahead of the GSP's private
+# tx.writePtr (msgq.c:526), the GSP's next message landed in a slot the driver
+# had already passed, and _kgspRpcRecvPoll (kernel_gsp.c:2097) burned its 45s
+# timeout on the reply that message was - Xid 119 in six VMs.  The harness now
+# only substitutes, which moves neither pointer, and only over an element whose
+# rpc.function is an asynchronous event (>= NV_VGPU_MSG_EVENT_FIRST_EVENT,
+# rpc_global_enums.h:238), since destroying an RPC return strands the poller in
+# the same way.  If no such element shows up within 50ms the call fails EAGAIN.
 #
-syz_mixed_gsp_status_msg(elem ptr[in, gsp_status_element], size bytesize[elem], avail int32[1:62], seq_delta int32[0:32])
+# Consequence: the queue can no longer be made to advertise more elements than
+# the GSP produced, so elem_count > 1 now only reaches the staging copy loop
+# (message_queue_cpu.c:632) when the GSP itself has that many messages pending.
+#
+syz_mixed_gsp_status_msg(elem ptr[in, gsp_status_element], size bytesize[elem], seq_delta int32[0:32])
