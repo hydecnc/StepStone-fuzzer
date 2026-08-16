@@ -31,6 +31,22 @@ static long syz_gpu_insert_buffer(std::uintptr_t buffer, const std::uint32_t siz
 #endif
 }
 
+static long syz_mixed_gsp_status_msg(std::uintptr_t elem, const std::uint32_t size,
+				     const std::uint32_t avail,
+				     const std::uint32_t seq_delta)
+{
+#if SYZ_EXECUTOR_NVIDIA
+	return gspStatusMsg(reinterpret_cast<const std::uint8_t*>(elem), size, avail,
+			    seq_delta);
+#else
+	(void)elem;
+	(void)size;
+	(void)avail;
+	(void)seq_delta;
+	return -1;
+#endif
+}
+
 #if SYZ_EXECUTOR_NVIDIA
 static const char* ptxSource = R"(
 .version 6.5

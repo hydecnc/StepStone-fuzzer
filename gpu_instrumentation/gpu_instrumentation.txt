@@ -4,4 +4,65 @@
 # The buffer is the whole mapping: page table, command queue, status queue.
 # 0x81000 bytes on silicon (0x1000 page table + 2 x 0x40000 queues).
 #
-syz_gpu_insert_buffer(buffer ptr[in, array[int8]], size bytesize[buffer], offset intptr[0:0x81000])
+# static: the offset is restricted to the status queue, [0x41000, 0x81000].
+# Everything below 0x41000 is memory the GSP itself consumes - its page table,
+# the command queue header (live cmd writePtr at +0x10, the driver's mirrored
+# status readPtr at +0x20) and the command queue entries.  Overwriting it wedged
+# the GSP in every boot of round 1; see LEDGER.md and instance-1/log:38909,
+# :78696.  The offset is re-checked at run time against the live
+# status_queue_offset in insertBuffer().
+#
+syz_gpu_insert_buffer(buffer ptr[in, array[int8]], size bytesize[buffer], offset intptr[0x41000:0x81000])
+
+#
+# rpc_message_header_v03_00, ogkm/src/nvidia/generated/g_rpc-message-header.h:41
+#
+gsp_rpc_header {
+	header_version		int32
+	signature		int32
+	length			int32
+	function		int32
+	rpc_result		int32
+	rpc_result_private	int32
+	sequence		int32
+	spare			int32
+} [packed]
+
+#
+# GSP_MSG_QUEUE_ELEMENT, ogkm/src/nvidia/inc/kernel/gpu/gsp/message_queue_priv.h:43
+#
+# check_sum and seq_num are const[0] because the harness overwrites them; every
+# other byte is the fuzzer's.  pad is the 4 bytes NV_DECLARE_ALIGNED(rpc, 8)
+# inserts between elem_count and rpc.
+#
+gsp_status_element {
+	auth_tag	array[int8, 16]
+	aad		array[int8, 16]
+	check_sum	const[0, int32]
+	seq_num		const[0, int32]
+	elem_count	int32
+	pad		const[0, int32]
+	rpc		gsp_rpc_header
+	payload		array[int8]
+} [packed]
+
+#
+# Place one GSP -> driver status queue message where the driver will read it next.
+#
+# mixed:
+#   static  - every byte of @elem except check_sum and seq_num: auth_tag, aad,
+#             elem_count, the whole rpc header (length, function, ...) and the
+#             payload.  @avail, @seq_delta.
+#   dynamic - the target slot, taken from the driver's own mirrored read pointer
+#             (msgq.c:682 writes it there); seq_num, derived from the sequence
+#             number left in the previously consumed slot; check_sum, solved so
+#             _checkSum32 over GSP_MSG_QUEUE_ELEMENT_HDR_SIZE + rpc.length comes
+#             out zero (message_queue_priv.h:112); and the status queue writePtr,
+#             set to slot + @avail so msgqRxGetReadAvailable (msgq.c:615) reports
+#             @avail elements.
+#
+# @avail is how many elements the queue is made to advertise, independent of
+# elem_count, so the copy loop at message_queue_cpu.c:632 can be driven past the
+# 16-element staging area.
+#
+syz_mixed_gsp_status_msg(elem ptr[in, gsp_status_element], size bytesize[elem], avail int32[1:62], seq_delta int32[0:32])
